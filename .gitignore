@@ -1,0 +1,34 @@
+# Python 字节码文件
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+venv/
+env/
+
+# IDE 配置文件
+.vscode/
+.idea/
+
+# 编译文件
+*.mpy
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+
+# 配置文件(可能包含敏感信息)
+config.py
+
+# 固件文件
+*.bin
+*.uf2
+
+# MicroPython 特定文件
+.micropython/
