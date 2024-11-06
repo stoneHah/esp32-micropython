@@ -35,6 +35,6 @@ def listen_for_commands():
             print('未知命令:', command)
 
 do_connect()
-listen_for_commands()
+# listen_for_commands()
 
 
