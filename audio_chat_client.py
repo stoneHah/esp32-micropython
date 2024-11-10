@@ -58,8 +58,16 @@ class AudioChatClient:
         self.is_connected = False
         
         # 音频缓冲区
-        self.audio_buffer_size = 1024
-        self.vad_threshold = 500  # 声音检测阈值，需要根据实际情况调整
+        self.audio_buffer_size = 1024  # 保持4096字节以获得足够的检测窗口
+        self.vad_window = []
+        self.vad_window_size = 4  # 保持4个窗口
+        self.vad_threshold = 200  # 降低阈值，使其更容易检测到声音
+        self.frames_to_confirm_silence = 6  # 降低到8帧，约2秒静音就停止
+        
+        # 确保这些变量被正确初始化
+        self.voice_frames = 0
+        self.silence_frames = 0
+        self.is_speaking = False
         
     def blink_led(self, times=1, interval=0.2):
         """LED闪烁指示"""
@@ -124,66 +132,139 @@ class AudioChatClient:
                 break
                 
     def detect_voice_activity(self, audio_data):
-        """简单的语音活动检测"""
-        # 计算音频数据的平均振幅
+        """改进的语音活动检测"""
         try:
-            # 将字节转换为16位整数
-            values = [int.from_bytes(audio_data[i:i+2], 'little', signed=True) 
-                     for i in range(0, len(audio_data), 2)]
-            average = sum(abs(v) for v in values) / len(values)
-            return average > self.vad_threshold
-        except:
+            # 计算当前帧的音量
+            total = 0
+            data_length = len(audio_data)  
+            i = 0
+            while i < data_length - 1:
+                # 将两个字节组合成16位整数
+                value = (audio_data[i+1] << 8) | audio_data[i]
+                if value & 0x8000:
+                    value -= 65536
+                total += abs(value)
+                i += 2
+            
+            current_average = total / (data_length // 2)
+            
+            # 更新滑动窗口
+            self.vad_window.append(current_average)
+            if len(self.vad_window) > self.vad_window_size:
+                self.vad_window.pop(0)
+            
+            # 计算窗口平均值
+            window_average = sum(self.vad_window) / len(self.vad_window)
+            
+            print(f"当前音量: {window_average:.2f}, 阈值: {self.vad_threshold}")
+            
+            # 声音检测逻辑
+            if window_average > self.vad_threshold:
+                self.voice_frames += 1
+                self.silence_frames = 0
+                if self.voice_frames > 2:
+                    self.is_speaking = True
+                    print("检测到说话")
+            else:
+                if self.is_speaking:  # 只在说话状态下计数静音帧
+                    self.silence_frames += 1
+                    print(f"静音帧数: {self.silence_frames}")
+                self.voice_frames = 0
+            
+            # 静音检测
+            if self.is_speaking and self.silence_frames >= self.frames_to_confirm_silence:
+                print(f"检测到{self.frames_to_confirm_silence}帧静音，停止录音")
+                return False
+            
+            return self.is_speaking
+            
+        except Exception as e:
+            print(f"VAD错误: {e}")
+            import sys
+            sys.print_exception(e)
             return False
                 
     def start_recording(self):
         """开始录音并发送"""
         self.current_state = self.STATE_RECORDING
         audio_buffer = bytearray(self.audio_buffer_size)
-        silence_count = 0  # 用于检测静音时长
+        
+        # 重置VAD相关的计数器
+        self.voice_frames = 0
+        self.silence_frames = 0
+        self.is_speaking = False
+        self.vad_window = []
         
         while self.current_state == self.STATE_RECORDING:
             try:
-                # 从麦克风读取数据
+                # 从麦克读取数据
                 num_read = self.audio_in.readinto(audio_buffer)
                 if num_read > 0:
                     print(f"发送数据块大小: {num_read} bytes")
-                    # 检测是否有声音活动
-                    if self.detect_voice_activity(audio_buffer):
-                        silence_count = 0
-                        self.led.value(1)  # 有声音时LED亮
-                    else:
-                        silence_count += 1
-                        self.led.value(0)  # 无声音时LED灭
-                        
-                    # 发送音频数据
-                    message = {
-                        'type': 'audio',
-                        'audio': bytes(audio_buffer[:num_read]).hex()
-                    }
-                    self.ws.send(json.dumps(message))
                     
-                    # 如果持续静音，自动停止录音
-                    if silence_count > 50:  # 约2-3秒静音
-                        print("约2-3秒静音，自动停止录音")
+                    # 检测是否有声音活动
+                    has_voice = self.detect_voice_activity(audio_buffer)
+                    self.led.value(1 if has_voice else 0)  # LED指示
+                    
+                    # 确保WebSocket连接有效
+                    if not self.is_connected:
+                        print("WebSocket连接已断开，尝试重新连接...")
+                        if not self.connect_websocket():
+                            print("重连失败，停止录音")
+                            self.stop_recording()
+                            break
+                    
+                    try:
+                        # 发送音频数据
+                        message = {
+                            'type': 'audio',
+                            'audio': bytes(audio_buffer[:num_read]).hex()
+                        }
+                        self.ws.send(json.dumps(message))
+                    except Exception as e:
+                        print(f"发送数据错误: {e}")
+                        self.is_connected = False
+                        continue  # 继续循环，让重连机制工作
+                    
+                    # 如果已经开始说话且检测到足够长的静音，自动停止录音
+                    if not has_voice and self.is_speaking:
+                        print("检测到足够长的静音，自动停止录音")
                         self.stop_recording()
                         break
                     
             except Exception as e:
-                print("录音错误:", e)
-                break
+                print(f"录音错误: {e}")
+                if "ECONNRESET" in str(e):
+                    print("连接被重置，尝试重新连接...")
+                    self.is_connected = False
+                    if not self.connect_websocket():
+                        print("重连失败，停止录音")
+                        self.stop_recording()
+                        break
+                else:
+                    break
                 
     def stop_recording(self):
         """停止录音"""
         if self.current_state == self.STATE_RECORDING:
             self.current_state = self.STATE_IDLE
             # 发送录音结束信号
-            try:
-                self.ws.send(json.dumps({
-                    'type': 'end_recording'
-                }))
-            except Exception as e:
-                print("发送结束信号失败:", e)
-                
+            if self.is_connected:
+                try:
+                    self.ws.send(json.dumps({
+                        'type': 'end_recording'
+                    }))
+                except Exception as e:
+                    print(f"发送结束信号失败: {e}")
+                    self.is_connected = False
+            
+            # 重置所有状态
+            self.voice_frames = 0
+            self.silence_frames = 0
+            self.is_speaking = False
+            self.vad_window = []
+            self.led.value(0)
+            
     def play_audio(self, audio_data):
         """播放音频数据"""
         try:
