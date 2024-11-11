@@ -9,6 +9,77 @@ from uwebsockets import connect  # 使用正确的导入方式
 # import upip
 # upip.install('micropython-websockets')
 
+class RingBuffer:
+    """环形缓冲区实现"""
+    def __init__(self, size):
+        self.size = size
+        self.buffer = bytearray(size)
+        self.write_pos = 0
+        self.read_pos = 0
+        self.available = 0
+        
+    def write(self, data):
+        """写入数据到缓冲区"""
+        print(f"写入数据到缓冲区")
+        data_len = len(data)
+        
+        # 检查是否有足够的空间写入数据
+        if data_len > self.size - self.available:
+            print("缓冲区空间不足")
+            return 0
+            
+        # 计算第一段可写入长度，需要考虑read_pos的位置
+        if self.write_pos >= self.read_pos:
+            # 写指针在读指针后面，需要考虑到缓冲区末尾的空间
+            first_part = min(data_len, self.size - self.write_pos)
+        else:
+            # 写指针在读指针前面，只能写到读指针位置
+            first_part = min(data_len, self.read_pos - self.write_pos)
+            
+        # 写入第一部分
+        self.buffer[self.write_pos:self.write_pos + first_part] = data[:first_part]
+        
+        if first_part < data_len:
+            # 需要环绕写入时，确保不会覆盖未读取的数据
+            second_part = data_len - first_part
+            if self.read_pos < second_part:
+                print("环绕写入时空间不足")
+                return first_part  # 只返回成功写入的部分
+                
+            self.buffer[0:second_part] = data[first_part:]
+            self.write_pos = second_part
+        else:
+            self.write_pos = (self.write_pos + first_part) % self.size
+            
+        self.available += data_len
+        print(f"写入数据后，缓冲区可用大小: {self.available}")
+        return data_len
+        
+    def read(self, size):
+        """从缓冲区读取数据"""
+        print(f"从缓冲区读取数据")
+        if self.available == 0:
+            return bytearray(0)
+            
+        read_size = min(size, self.available)
+        first_part = min(read_size, self.size - self.read_pos)
+        result = bytearray(read_size)
+        
+        result[:first_part] = self.buffer[self.read_pos:self.read_pos + first_part]
+        
+        if first_part < read_size:
+            # 需要环绕读取
+            print(f"需要环绕读取")
+            second_part = read_size - first_part
+            result[first_part:] = self.buffer[0:second_part]
+            self.read_pos = second_part
+        else:
+            print(f"不需要环绕读取")
+            self.read_pos = (self.read_pos + first_part) % self.size
+            
+        self.available -= read_size
+        return result
+
 class AudioChatClient:
     def __init__(self):
         # 状态标志
@@ -69,6 +140,16 @@ class AudioChatClient:
         self.silence_frames = 0
         self.is_speaking = False
         
+        # 音频播放缓冲区
+        self.play_buffer = RingBuffer(8096 * 2)  # 32KB的环形缓冲区
+        self.play_chunk_size = 1024  # 每次播放1KB
+        self.min_play_size = 4096   # 至少累积4KB才开始播放
+        self._is_playing = False
+        self._player_thread_running = False
+        
+        # 在初始化时就启动播放线程
+        self._start_player_thread()
+        
     def blink_led(self, times=1, interval=0.2):
         """LED闪烁指示"""
         for _ in range(times):
@@ -106,6 +187,7 @@ class AudioChatClient:
                 data = json.loads(message)
                 
                 if data['type'] == 'audio':
+                    print("收到音频数据")  # 减少打印数据量
                     # 收到音频数据，播放
                     self.current_state = self.STATE_PLAYING
                     self.led.value(1)  # LED常亮表示播放中
@@ -128,6 +210,8 @@ class AudioChatClient:
                     
             except Exception as e:
                 print("接收消息错误:", e)
+                import sys
+                sys.print_exception(e)  # 打印详细错误信息
                 self.is_connected = False
                 break
                 
@@ -265,14 +349,55 @@ class AudioChatClient:
             self.vad_window = []
             self.led.value(0)
             
+    def start_audio_player(self):
+        """开始播放音频"""
+        self._is_playing = True
+        
+    def stop_audio_player(self):
+        """停止当前音频的播放"""
+        self._is_playing = False
+        
+    def _audio_player_thread(self):
+        """音频播放线程"""
+        print("+++++++++++++++播放线程开始运行")
+        while self._player_thread_running:
+            # 确保缓冲区中有足够的数据再开始播放
+            # print(f"+++++++++++播放线程循环中,is_playing: {self._is_playing},缓冲区大小: {self.play_buffer.available}")
+            if self._is_playing and self.play_buffer.available >= self.min_play_size:
+                print(f"+++++++++++++++播放缓冲区大小: {self.play_buffer.available}")
+                try:
+                    chunk = self.play_buffer.read(self.play_chunk_size)
+                    self.audio_out.write(chunk)
+                    # time.sleep_ms(10)
+                except Exception as e:
+                    print("播放线程错误:", e)
+            else:
+                time.sleep_ms(20)
+        print("播放线程结束")
+                
     def play_audio(self, audio_data):
-        """播放音频数据"""
+        """处理接收到的音频数据"""
         try:
-            # 将hex字符串转换回字节
-            audio_bytes = bytes.fromhex(audio_data)
-            self.audio_out.write(audio_bytes)
+            # 开始播放
+            self.start_audio_player()
+            
+            # 直接处理2048字节的���频数据
+            chunk_bytes = bytes.fromhex(audio_data)
+            
+            # 写入环形缓冲区
+            while len(chunk_bytes) > 0:
+                written = self.play_buffer.write(chunk_bytes)
+                if written == 0:
+                    # 缓冲区满，等待一会
+                    time.sleep_ms(20)
+                else:
+                    chunk_bytes = chunk_bytes[written:]
+                
+                
         except Exception as e:
             print("播放错误:", e)
+            import sys
+            sys.print_exception(e)
             
     def button_handler(self, pin):
         """按钮中断处理"""
@@ -317,6 +442,7 @@ class AudioChatClient:
         """清理资源"""
         self.current_state = self.STATE_IDLE
         self.is_connected = False
+        self._player_thread_running = False  # 停止播放线程
         if self.ws:
             try:
                 self.ws.close()
@@ -325,6 +451,11 @@ class AudioChatClient:
         self.audio_in.deinit()
         self.audio_out.deinit()
         self.led.value(0)
+
+    def _start_player_thread(self):
+        """启动音频播放线程"""
+        self._player_thread_running = True
+        _thread.start_new_thread(self._audio_player_thread, ())
 
 # 使用示例
 # if __name__ == "__main__":
