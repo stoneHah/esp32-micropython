@@ -116,7 +116,7 @@ class AudioChatClient:
             mode=I2S.TX,           
             bits=16,               
             format=I2S.MONO,       
-            rate=16000,            
+            rate=24000,            
             ibuf=4096,
             # dma_buf_count=8,
             # dma_buf_len=1024
