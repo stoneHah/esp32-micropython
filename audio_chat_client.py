@@ -143,7 +143,7 @@ class AudioChatClient:
         # 音频播放缓冲区
         self.play_buffer = RingBuffer(8096 * 2)  # 32KB的环形缓冲区
         self.play_chunk_size = 1024  # 每次播放1KB
-        self.min_play_size = 4096   # 至少累积4KB才开始播放
+        self.min_play_size = 0   # 至少累积4KB才开始播放
         self._is_playing = False
         self._player_thread_running = False
         
@@ -191,7 +191,8 @@ class AudioChatClient:
                     # 收到音频数据，播放
                     self.current_state = self.STATE_PLAYING
                     self.led.value(1)  # LED常亮表示播放中
-                    self.play_audio(data['audio'])
+                    self.audio_out.write(bytes.fromhex(data['audio']))
+                    # self.play_audio(data['audio'])
                     self.led.value(0)
                     self.current_state = self.STATE_IDLE
                     
@@ -363,7 +364,7 @@ class AudioChatClient:
         while self._player_thread_running:
             # 确保缓冲区中有足够的数据再开始播放
             # print(f"+++++++++++播放线程循环中,is_playing: {self._is_playing},缓冲区大小: {self.play_buffer.available}")
-            if self._is_playing and self.play_buffer.available >= self.min_play_size:
+            if self._is_playing and self.play_buffer.available > 0:
                 print(f"+++++++++++++++播放缓冲区大小: {self.play_buffer.available}")
                 try:
                     chunk = self.play_buffer.read(self.play_chunk_size)
@@ -455,7 +456,7 @@ class AudioChatClient:
     def _start_player_thread(self):
         """启动音频播放线程"""
         self._player_thread_running = True
-        _thread.start_new_thread(self._audio_player_thread, ())
+        # _thread.start_new_thread(self._audio_player_thread, ())
 
 # 使用示例
 # if __name__ == "__main__":
