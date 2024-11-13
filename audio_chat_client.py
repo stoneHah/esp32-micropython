@@ -127,7 +127,6 @@ class AudioChatClient:
         self.ws = None
         self.ws_server = "ws://192.168.2.227:8000/ws"
         self.reconnect_attempts = 3
-        self.is_connected = False
         
         # 音频缓冲区
         self.audio_buffer_size = 1024  # 保持4096字节以获得足够的检测窗口
@@ -169,7 +168,6 @@ class AudioChatClient:
                 # 使用uwebsockets的connect函数创建连接
                 self.ws = connect(self.ws_server)
                 print("WebSocket连接成功")
-                self.is_connected = True
                 self.blink_led(2)  # 连接成功指示
                 return True
             except Exception as e:
@@ -180,42 +178,40 @@ class AudioChatClient:
             
     def receive_messages(self):
         """接收服务器消息的线程"""
-        while self.is_connected:
+        while True:
+            if not self.ws.open:
+                time.sleep(0.5)  # 连接断开时等待
+                continue
+                
             try:
                 # 使用uwebsockets的recv方法接收消息
                 message = self.ws.recv()
                 if message is None:  # 检查是否接收到None
-                    print("未接收到消息，可能是暂时没有数据")
+                    time.sleep(0.01)  # 没有消息时短暂休眠
                     continue
                     
                 data = json.loads(message)
                 
                 if data['type'] == 'audio':
-                    print("收到音频数据")  # 减少打印数据量
-                    # 不要直接播放，而是写入缓冲区
+                    print("收到音频数据")
                     audio_bytes = bytes.fromhex(data['audio'])
                     self.audio_out.write(audio_bytes)
-                    # self.play_audio(audio_bytes)  # 使用缓冲区机制
                     
                 elif data['type'] == 'text':
-                    # 收到文本消息
                     print("AI回复:", data['text'])
                     
                 elif data['type'] == 'status':
-                    # 处理状态消息
                     print("状态:", data['message'])
                     
                 elif data['type'] == 'error':
-                    # 处理错误消息
                     print("错误:", data['message'])
                     self.blink_led(3, 0.1)
                     
             except Exception as e:
                 print("接收消息错误:", e)
                 import sys
-                sys.print_exception(e)  # 打印详细错误信息
-                self.is_connected = False
-                break
+                sys.print_exception(e)
+                time.sleep(0.5)  # 发生错误时等待longer
                 
     def detect_voice_activity(self, audio_data):
         """改进的语音活动检测"""
@@ -293,7 +289,7 @@ class AudioChatClient:
                     self.led.value(1 if has_voice else 0)  # LED指示
                     
                     # 发送音频数据 - 不再在这里处理连接状态
-                    if self.is_connected:
+                    if self.ws.open:
                         try:
                             message = {
                                 'type': 'audio',
@@ -302,7 +298,6 @@ class AudioChatClient:
                             self.ws.send(json.dumps(message))
                         except Exception as e:
                             print(f"发送数据错误: {e}")
-                            self.is_connected = False
                     
                     # 如果已经开始说话且检测到足够长的静音，自动停止录音
                     if not has_voice and self.is_speaking:
@@ -319,14 +314,13 @@ class AudioChatClient:
         if self.current_state == self.STATE_RECORDING:
             self.current_state = self.STATE_IDLE
             # 发送录音结束信号
-            if self.is_connected:
+            if self.ws.open:
                 try:
                     self.ws.send(json.dumps({
                         'type': 'end_recording'
                     }))
                 except Exception as e:
                     print(f"发送结束信号失败: {e}")
-                    self.is_connected = False
             
             # 重置所有状态
             self.voice_frames = 0
@@ -394,7 +388,7 @@ class AudioChatClient:
         while self._ws_monitor_running:
             try:
                 current_time = time.time()
-                if not self.is_connected and (current_time - self._last_ws_check) >= self.ws_check_interval:
+                if not self.ws.open and (current_time - self._last_ws_check) >= self.ws_check_interval:
                     print("检测到WebSocket断开，尝试重连...")
                     if self.connect_websocket():
                         print("WebSocket重连成功")
@@ -439,13 +433,8 @@ class AudioChatClient:
         """清理资源"""
         self._ws_monitor_running = False  # 停止WebSocket监控
         self.current_state = self.STATE_IDLE
-        self.is_connected = False
         self._player_thread_running = False
-        if self.ws:
-            try:
-                self.ws.close()
-            except:
-                pass
+        self.ws.close()
         self.audio_in.deinit()
         self.audio_out.deinit()
         self.led.value(0)
