@@ -9,6 +9,7 @@ from uwebsockets import connect  # 使用正确的导入方式
 # import upip
 # upip.install('micropython-websockets')
 
+
 class RingBuffer:
     """环形缓冲区实现"""
     def __init__(self, size):
@@ -124,7 +125,7 @@ class AudioChatClient:
         
         # WebSocket配置
         self.ws = None
-        self.ws_server = "ws://192.168.0.109:8000/ws"
+        self.ws_server = "ws://192.168.2.227:8000/ws"
         self.reconnect_attempts = 3
         self.is_connected = False
         
