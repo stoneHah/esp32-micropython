@@ -21,12 +21,12 @@ class RingBuffer:
         
     def write(self, data):
         """写入数据到缓冲区"""
-        print(f"写入数据到缓冲区")
+        print(f"write:begin写入数据到缓冲区,可用大小: {self.available}")
         data_len = len(data)
         
         # 检查是否有足够的空间写入数据
         if data_len > self.size - self.available:
-            print("缓冲区空间不足")
+            print("write:缓冲区空间不足")
             return 0
         
         write_size = 0
@@ -60,16 +60,16 @@ class RingBuffer:
             write_size += first_part
             
         self.available += write_size
-        print(f"写入数据后，缓冲区可用大小: {self.available}")
+        print(f"write:after写入数据后，缓冲区可用大小: {self.available}")
         return write_size
         
     def read(self, size):
         """从缓冲区读取数据"""
         # with self.lock:
-        print(f"从缓冲区读取数据")
         if self.available == 0:
             return bytearray(0)
             
+        print(f"read--begin:从缓冲区读取数据，可用大小: {self.available}")
         read_size = min(size, self.available)
         
         if self.read_pos < self.write_pos:
@@ -101,7 +101,7 @@ class RingBuffer:
                 
                 self.available -= first_part
                 
-        
+        print(f"read--after:从缓冲区读取数据，可用大小: {self.available}")
         return result
 
 class AudioChatClient:
@@ -148,8 +148,9 @@ class AudioChatClient:
         
         # WebSocket配置
         self.ws = None
-        self.ws_server = "ws://192.168.2.227:8000/ws"
+        self.ws_server = "ws://192.168.0.109:8000/ws"
         self.reconnect_attempts = 3
+        self.is_connected = False
         
         # 音频缓冲区
         self.audio_buffer_size = 1024  # 保持4096字节以获得足够的检测窗口
@@ -189,17 +190,21 @@ class AudioChatClient:
                 self.ws = connect(self.ws_server)
                 print("WebSocket连接成功")
                 self.blink_led(2)  # 连接成功指示
+                self.is_connected = True
                 return True
             except Exception as e:
                 print(f"WebSocket连接失败 (尝试 {attempt + 1}/{self.reconnect_attempts}): {e}")
                 self.blink_led(5, 0.1)  # 错误指示
                 time.sleep(2)
         return False
+    
+    def _is_ws_connected(self):
+        return self.ws.open and self.is_connected
             
     def receive_messages(self):
         """接收服务器消息的线程"""
         while True:
-            if not self.ws.open:
+            if not self._is_ws_connected():
                 time.sleep(0.5)  # 连接断开时等待
                 continue
                 
@@ -213,8 +218,9 @@ class AudioChatClient:
                 data = json.loads(message)
                 
                 if data['type'] == 'audio':
-                    print("收到音频数据")
+                    print("ws:Received audio data")
                     audio_bytes = bytes.fromhex(data['audio'])
+                    # self.audio_out.write(audio_bytes)
                     self.play_audio(audio_bytes)
                     
                 elif data['type'] == 'text':
@@ -226,7 +232,15 @@ class AudioChatClient:
                 elif data['type'] == 'error':
                     print("错误:", data['message'])
                     self.blink_led(3, 0.1)
-                    
+            except OSError as e:
+                if e.args[0] == 128:  # ENOTCONN
+                    print("WebSocket连接已断开")
+                    self.is_connected = False
+                    break
+                else:
+                    print(f"网络错误: {e}")
+                    # 其他网络错误可能是临时的，可以继续尝试
+                    time.sleep(1)        
             except Exception as e:
                 print("接收消息错误:", e)
                 import sys
@@ -360,7 +374,7 @@ class AudioChatClient:
     def audio_player_thread(self):
         """音频播放线程"""
         print("播放线程开始运行")
-        buffer_low_threshold = self.play_chunk_size * 2  # 缓冲区低阈值
+        buffer_low_threshold = self.play_chunk_size * 4  # 缓冲区低阈值
         waiting_for_data = True  # 是否在等待数据积累
         
         while self._player_thread_running:
@@ -373,6 +387,7 @@ class AudioChatClient:
                 # 只在开始播放时检查缓冲区阈值
                 if waiting_for_data:
                     if self.play_buffer.available < buffer_low_threshold:
+                        print(f"play:等待数据积累，可用大小: {self.play_buffer.available}")
                         time.sleep_ms(5)
                         continue
                     waiting_for_data = False  # 数据足够，开始播放
@@ -388,9 +403,9 @@ class AudioChatClient:
                     except Exception as e:
                         print(f"I2S写入错误: {e}")
                         raise
-                else:
-                    waiting_for_data = True  # 缓冲区空了，等待新数据
-                    time.sleep_ms(5)
+                # else:
+                    # waiting_for_data = True  # 缓冲区空了，等待新数据
+                    # time.sleep_ms(5)
                         
             except Exception as e:
                 print("播放线程错误:", e)
@@ -433,7 +448,7 @@ class AudioChatClient:
         while self._ws_monitor_running:
             try:
                 current_time = time.time()
-                if not self.ws.open and (current_time - self._last_ws_check) >= self.ws_check_interval:
+                if not self._is_ws_connected() and (current_time - self._last_ws_check) >= self.ws_check_interval:
                     print("检测到WebSocket断开，尝试重连...")
                     if self.connect_websocket():
                         print("WebSocket重连成功")
