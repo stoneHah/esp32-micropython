@@ -28,57 +28,80 @@ class RingBuffer:
         if data_len > self.size - self.available:
             print("缓冲区空间不足")
             return 0
+        
+        write_size = 0
             
-        # 计算第一段可写入长度，需要考虑read_pos的位置
+        # 计算可写入长度
         if self.write_pos >= self.read_pos:
-            # 写指针在读指针后面，需要考虑到缓冲区末尾的空间
+            # 写指针在读指针后面或相等
+            # 可以写到缓冲区末尾，如果数据还有剩余且读指针不在开头，才能绕到开头继续写
             first_part = min(data_len, self.size - self.write_pos)
+            # 写入第一部分
+            self.buffer[self.write_pos:self.write_pos + first_part] = data[:first_part]
+            write_size += first_part
+            
+            if first_part < data_len:
+                # 还有数据需要写入，且必须确保不会覆盖到读指针
+                if self.read_pos > 0:  # 只有读指针不在开头时才能写入第二部分
+                    second_part = min(data_len - first_part, self.read_pos)
+                    self.buffer[0:second_part] = data[first_part:first_part + second_part]
+                    self.write_pos = second_part
+                    write_size += second_part
+                else:
+                    # 读指针在开头，不能环绕写入
+                    self.write_pos = 0
+            else:
+                self.write_pos = (self.write_pos + first_part) % self.size
         else:
             # 写指针在读指针前面，只能写到读指针位置
             first_part = min(data_len, self.read_pos - self.write_pos)
+            self.buffer[self.write_pos:self.write_pos + first_part] = data[:first_part]
+            self.write_pos += first_part
+            write_size += first_part
             
-        # 写入第一部分
-        self.buffer[self.write_pos:self.write_pos + first_part] = data[:first_part]
-        
-        if first_part < data_len:
-            # 需要环绕写入时，确保不会覆盖未读取的数据
-            second_part = data_len - first_part
-            if self.read_pos < second_part:
-                print("环绕写入时空间不足")
-                return first_part  # 只返回成功写入的部分
-                
-            self.buffer[0:second_part] = data[first_part:]
-            self.write_pos = second_part
-        else:
-            self.write_pos = (self.write_pos + first_part) % self.size
-            
-        self.available += data_len
+        self.available += write_size
         print(f"写入数据后，缓冲区可用大小: {self.available}")
-        return data_len
+        return write_size
         
     def read(self, size):
         """从缓冲区读取数据"""
+        # with self.lock:
         print(f"从缓冲区读取数据")
         if self.available == 0:
             return bytearray(0)
             
         read_size = min(size, self.available)
-        first_part = min(read_size, self.size - self.read_pos)
-        result = bytearray(read_size)
         
-        result[:first_part] = self.buffer[self.read_pos:self.read_pos + first_part]
-        
-        if first_part < read_size:
-            # 需要环绕读取
-            print(f"需要环绕读取")
-            second_part = read_size - first_part
-            result[first_part:] = self.buffer[0:second_part]
-            self.read_pos = second_part
-        else:
-            print(f"不需要环绕读取")
-            self.read_pos = (self.read_pos + first_part) % self.size
+        if self.read_pos < self.write_pos:
+            # 读指针在写指针前面，最多只能读取到写指针位置
+            first_part = min(read_size, self.write_pos - self.read_pos)
+            result = bytearray(first_part)
+            result = self.buffer[self.read_pos:self.read_pos + first_part]
+            self.read_pos += first_part
             
-        self.available -= read_size
+            self.available -= first_part
+            
+        else:
+            # 读指针在写指针后面或相等，需要考虑环绕读取
+            first_part = min(read_size, self.size - self.read_pos)
+            result = bytearray(read_size)
+            result[:first_part] = self.buffer[self.read_pos:self.read_pos + first_part]
+            
+            if first_part < read_size:
+                # 需要环绕读取
+                print(f"需要环绕读取")
+                second_part = min(read_size - first_part, self.write_pos)
+                result[first_part:] = self.buffer[0:second_part]
+                self.read_pos = second_part
+                
+                self.available -= (first_part + second_part)
+            else:
+                print(f"不需要环绕读取")
+                self.read_pos = (self.read_pos + first_part) % self.size
+                
+                self.available -= first_part
+                
+        
         return result
 
 class AudioChatClient:
@@ -141,13 +164,10 @@ class AudioChatClient:
         self.is_speaking = False
         
         # 音频播放缓冲区
-        self.play_buffer = RingBuffer(1024 * 8)  # 8KB的环形缓冲区
-        self.play_chunk_size = 1024  # 每次播放1KB
+        self.play_buffer = RingBuffer(1024 * 32)  # 8KB的环形缓冲区
+        self.play_chunk_size = 1024  # 每次播放2KB
         self._is_playing = False
-        self._player_thread_running = False
-        
-        # 在初始化时就启动播放线程
-        # self._start_player_thread()
+        self._player_thread_running = True
         
         self._ws_monitor_running = False
         self._last_ws_check = time.time()
@@ -195,7 +215,7 @@ class AudioChatClient:
                 if data['type'] == 'audio':
                     print("收到音频数据")
                     audio_bytes = bytes.fromhex(data['audio'])
-                    self.audio_out.write(audio_bytes)
+                    self.play_audio(audio_bytes)
                     
                 elif data['type'] == 'text':
                     print("AI回复:", data['text'])
@@ -337,19 +357,44 @@ class AudioChatClient:
         """停止当前音频的播放"""
         self._is_playing = False
         
-    def _audio_player_thread(self):
+    def audio_player_thread(self):
         """音频播放线程"""
-        print("+++++++++++++++播放线程开始运行")
+        print("播放线程开始运行")
+        buffer_low_threshold = self.play_chunk_size * 2  # 缓冲区低阈值
+        waiting_for_data = True  # 是否在等待数据积累
+        
         while self._player_thread_running:
-            if self._is_playing and self.play_buffer.available > 0:
-                try:
+            try:
+                if not self._is_playing:
+                    time.sleep_ms(10)
+                    waiting_for_data = True  # 重置等待标志
+                    continue
+                    
+                # 只在开始播放时检查缓冲区阈值
+                if waiting_for_data:
+                    if self.play_buffer.available < buffer_low_threshold:
+                        time.sleep_ms(5)
+                        continue
+                    waiting_for_data = False  # 数据足够，开始播放
+                
+                # 只要有数据就播放
+                if self.play_buffer.available > 0:
                     chunk_size = min(self.play_chunk_size, self.play_buffer.available)
                     chunk = self.play_buffer.read(chunk_size)
-                    self.audio_out.write(chunk)
-                except Exception as e:
-                    print("播放线程错误:", e)
-            else:
-                time.sleep_ms(10)  # 减少等待时间
+                    
+                    try:
+                        # 直接写入整个数据块
+                        self.audio_out.write(chunk)
+                    except Exception as e:
+                        print(f"I2S写入错误: {e}")
+                        raise
+                else:
+                    waiting_for_data = True  # 缓冲区空了，等待新数据
+                    time.sleep_ms(5)
+                        
+            except Exception as e:
+                print("播放线程错误:", e)
+                time.sleep_ms(10)
                 
     def play_audio(self, audio_bytes):
         """处理接收到的音频数据"""
@@ -367,7 +412,7 @@ class AudioChatClient:
             self.start_audio_player()
                 
         except Exception as e:
-            print("音频处理错误:", e)
+            print("音频写入环形缓冲区错误:", e)
             
     def button_handler(self, pin):
         """按钮中断处理"""
@@ -415,6 +460,9 @@ class AudioChatClient:
             # 启动接收消息的线程
             _thread.start_new_thread(self.receive_messages, ())
             
+            # 启动播放线程
+            _thread.start_new_thread(self.audio_player_thread, ())
+            
             # 设置按钮中断
             self.button.irq(trigger=Pin.IRQ_FALLING, handler=self.button_handler)
             
@@ -439,12 +487,8 @@ class AudioChatClient:
         self.audio_out.deinit()
         self.led.value(0)
 
-    def _start_player_thread(self):
-        """启动音频播放线程"""
-        self._player_thread_running = True
-        _thread.start_new_thread(self._audio_player_thread, ())
 
 # 使用示例
 # if __name__ == "__main__":
-chat_client = AudioChatClient()
-chat_client.start_chat()
+# chat_client = AudioChatClient()
+# chat_client.start_chat()

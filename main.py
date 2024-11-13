@@ -1,4 +1,4 @@
-# from audio_chat_client import AudioChatClient
+from audio_chat_client import AudioChatClient
 
-# client = AudioChatClient()
-# client.run()
+chat_client = AudioChatClient()
+chat_client.start_chat()
