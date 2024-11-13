@@ -117,7 +117,7 @@ class AudioChatClient:
             mode=I2S.TX,           
             bits=16,               
             format=I2S.MONO,       
-            rate=16000,            
+            rate=24000,            
             ibuf=4096,
             # dma_buf_count=8,
             # dma_buf_len=1024
@@ -142,14 +142,17 @@ class AudioChatClient:
         self.is_speaking = False
         
         # 音频播放缓冲区
-        self.play_buffer = RingBuffer(8096 * 2)  # 32KB的环形缓冲区
+        self.play_buffer = RingBuffer(1024 * 8)  # 8KB的环形缓冲区
         self.play_chunk_size = 1024  # 每次播放1KB
-        self.min_play_size = 0   # 至少累积4KB才开始播放
         self._is_playing = False
         self._player_thread_running = False
         
         # 在初始化时就启动播放线程
-        self._start_player_thread()
+        # self._start_player_thread()
+        
+        self._ws_monitor_running = False
+        self._last_ws_check = time.time()
+        self.ws_check_interval = 5  # 每5秒检查一次连接状态
         
     def blink_led(self, times=1, interval=0.2):
         """LED闪烁指示"""
@@ -181,21 +184,18 @@ class AudioChatClient:
             try:
                 # 使用uwebsockets的recv方法接收消息
                 message = self.ws.recv()
-                if not message:  # 连接关闭
-                    self.is_connected = False
-                    break
+                if message is None:  # 检查是否接收到None
+                    print("未接收到消息，可能是暂时没有数据")
+                    continue
                     
                 data = json.loads(message)
                 
                 if data['type'] == 'audio':
                     print("收到音频数据")  # 减少打印数据量
-                    # 收到音频数据，播放
-                    self.current_state = self.STATE_PLAYING
-                    self.led.value(1)  # LED常亮表示播放中
-                    self.audio_out.write(bytes.fromhex(data['audio']))
-                    # self.play_audio(data['audio'])
-                    self.led.value(0)
-                    self.current_state = self.STATE_IDLE
+                    # 不要直接播放，而是写入缓冲区
+                    audio_bytes = bytes.fromhex(data['audio'])
+                    self.audio_out.write(audio_bytes)
+                    # self.play_audio(audio_bytes)  # 使用缓冲区机制
                     
                 elif data['type'] == 'text':
                     # 收到文本消息
@@ -292,25 +292,17 @@ class AudioChatClient:
                     has_voice = self.detect_voice_activity(audio_buffer)
                     self.led.value(1 if has_voice else 0)  # LED指示
                     
-                    # 确保WebSocket连接有效
-                    if not self.is_connected:
-                        print("WebSocket连接已断开，尝试重新连接...")
-                        if not self.connect_websocket():
-                            print("重连失败，停止录音")
-                            self.stop_recording()
-                            break
-                    
-                    try:
-                        # 发送音频数据
-                        message = {
-                            'type': 'audio',
-                            'audio': bytes(audio_buffer[:num_read]).hex()
-                        }
-                        self.ws.send(json.dumps(message))
-                    except Exception as e:
-                        print(f"发送数据错误: {e}")
-                        self.is_connected = False
-                        continue  # 继续循环，让重连机制工作
+                    # 发送音频数据 - 不再在这里处理连接状态
+                    if self.is_connected:
+                        try:
+                            message = {
+                                'type': 'audio',
+                                'audio': bytes(audio_buffer[:num_read]).hex()
+                            }
+                            self.ws.send(json.dumps(message))
+                        except Exception as e:
+                            print(f"发送数据错误: {e}")
+                            self.is_connected = False
                     
                     # 如果已经开始说话且检测到足够长的静音，自动停止录音
                     if not has_voice and self.is_speaking:
@@ -320,15 +312,7 @@ class AudioChatClient:
                     
             except Exception as e:
                 print(f"录音错误: {e}")
-                if "ECONNRESET" in str(e):
-                    print("连接被重置，尝试重新连接...")
-                    self.is_connected = False
-                    if not self.connect_websocket():
-                        print("重连失败，停止录音")
-                        self.stop_recording()
-                        break
-                else:
-                    break
+                break
                 
     def stop_recording(self):
         """停止录音"""
@@ -363,43 +347,33 @@ class AudioChatClient:
         """音频播放线程"""
         print("+++++++++++++++播放线程开始运行")
         while self._player_thread_running:
-            # 确保缓冲区中有足够的数据再开始播放
-            # print(f"+++++++++++播放线程循环中,is_playing: {self._is_playing},缓冲区大小: {self.play_buffer.available}")
             if self._is_playing and self.play_buffer.available > 0:
-                print(f"+++++++++++++++播放缓冲区大小: {self.play_buffer.available}")
                 try:
-                    chunk = self.play_buffer.read(self.play_chunk_size)
+                    chunk_size = min(self.play_chunk_size, self.play_buffer.available)
+                    chunk = self.play_buffer.read(chunk_size)
                     self.audio_out.write(chunk)
-                    # time.sleep_ms(10)
                 except Exception as e:
                     print("播放线程错误:", e)
             else:
-                time.sleep_ms(20)
-        print("播放线程结束")
+                time.sleep_ms(10)  # 减少等待时间
                 
-    def play_audio(self, audio_data):
+    def play_audio(self, audio_bytes):
         """处理接收到的音频数据"""
         try:
-            # 开始播放
-            self.start_audio_player()
-            
-            # 直接处理2048字节的���频数据
-            chunk_bytes = bytes.fromhex(audio_data)
-            
             # 写入环形缓冲区
-            while len(chunk_bytes) > 0:
-                written = self.play_buffer.write(chunk_bytes)
+            while len(audio_bytes) > 0:
+                written = self.play_buffer.write(audio_bytes)
                 if written == 0:
                     # 缓冲区满，等待一会
                     time.sleep_ms(20)
                 else:
-                    chunk_bytes = chunk_bytes[written:]
-                
+                    audio_bytes = audio_bytes[written:]
+            
+            # 开始播放
+            self.start_audio_player()
                 
         except Exception as e:
-            print("播放错误:", e)
-            import sys
-            sys.print_exception(e)
+            print("音频处理错误:", e)
             
     def button_handler(self, pin):
         """按钮中断处理"""
@@ -412,13 +386,38 @@ class AudioChatClient:
                 print("停止录音...")
                 self.stop_recording()
             
+    def monitor_websocket(self):
+        """WebSocket连接监控线程"""
+        print("开始WebSocket监控")
+        self._ws_monitor_running = True
+        
+        while self._ws_monitor_running:
+            try:
+                current_time = time.time()
+                if not self.is_connected and (current_time - self._last_ws_check) >= self.ws_check_interval:
+                    print("检测到WebSocket断开，尝试重连...")
+                    if self.connect_websocket():
+                        print("WebSocket重连成功")
+                    else:
+                        print("WebSocket重连失败")
+                    self._last_ws_check = current_time
+                    
+                time.sleep(1)
+            except Exception as e:
+                print(f"WebSocket监控错误: {e}")
+                time.sleep(1)
+
     def start_chat(self):
         """开始对话"""
         try:
+            # 初始连接
             if not self.connect_websocket():
                 print("无法连接到服务器")
                 return
                 
+            # 启动WebSocket监控线程
+            _thread.start_new_thread(self.monitor_websocket, ())
+            
             # 启动接收消息的线程
             _thread.start_new_thread(self.receive_messages, ())
             
@@ -427,12 +426,8 @@ class AudioChatClient:
             
             print("准备就绪，按下按钮开始/停止录音")
             
-            # 主循环保持运行
+            # 主循环
             while True:
-                if not self.is_connected:
-                    print("正在重新连接...")
-                    if not self.connect_websocket():
-                        break
                 time.sleep(1)
                 
         except KeyboardInterrupt:
@@ -442,9 +437,10 @@ class AudioChatClient:
             
     def cleanup(self):
         """清理资源"""
+        self._ws_monitor_running = False  # 停止WebSocket监控
         self.current_state = self.STATE_IDLE
         self.is_connected = False
-        self._player_thread_running = False  # 停止播放线程
+        self._player_thread_running = False
         if self.ws:
             try:
                 self.ws.close()
@@ -457,7 +453,7 @@ class AudioChatClient:
     def _start_player_thread(self):
         """启动音频播放线程"""
         self._player_thread_running = True
-        # _thread.start_new_thread(self._audio_player_thread, ())
+        _thread.start_new_thread(self._audio_player_thread, ())
 
 # 使用示例
 # if __name__ == "__main__":
