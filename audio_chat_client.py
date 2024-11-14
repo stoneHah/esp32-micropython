@@ -374,43 +374,55 @@ class AudioChatClient:
     def audio_player_thread(self):
         """音频播放线程"""
         print("播放线程开始运行")
-        buffer_low_threshold = self.play_chunk_size * 4  # 缓冲区低阈值
-        waiting_for_data = True  # 是否在等待数据积累
+        buffer_low_threshold = self.play_chunk_size * 8
+        buffer_high_threshold = self.play_chunk_size * 16
+        waiting_for_data = True
+        last_data_time = time.time()  # 记录最后一次有数据的时间
         
         while self._player_thread_running:
             try:
                 if not self._is_playing:
                     time.sleep_ms(10)
-                    waiting_for_data = True  # 重置等待标志
+                    waiting_for_data = True
                     continue
                     
-                # 只在开始播放时检查缓冲区阈值
-                if waiting_for_data:
-                    if self.play_buffer.available < buffer_low_threshold:
-                        print(f"play:等待数据积累，可用大小: {self.play_buffer.available}")
-                        time.sleep_ms(5)
-                        continue
-                    waiting_for_data = False  # 数据足够，开始播放
+                current_time = time.time()
                 
-                # 只要有数据就播放
+                # 检查是否长时间没有新数据
+                if self.play_buffer.available == 0 and (current_time - last_data_time) > 5:
+                    print("5秒内没有新数据，重置播放状态")
+                    waiting_for_data = True
+                    self._is_playing = False
+                    continue
+                    
+                # 缓冲区管理策略
+                if waiting_for_data:
+                    if self.play_buffer.available < buffer_high_threshold:
+                        print(f"play:等待数据积累，当前: {self.play_buffer.available}/{buffer_high_threshold}")
+                        time.sleep_ms(10)
+                        continue
+                    waiting_for_data = False
+                
+                # 播放逻辑
                 if self.play_buffer.available > 0:
+                    last_data_time = current_time  # 更新最后一次有数据的时间
                     chunk_size = min(self.play_chunk_size, self.play_buffer.available)
                     chunk = self.play_buffer.read(chunk_size)
                     
                     try:
-                        # 直接写入整个数据块
-                        self.audio_out.write(chunk)
+                        num_written = 0
+                        while num_written < len(chunk):
+                            num_written += self.audio_out.write(buf[num_written:len(chunk)])
                     except Exception as e:
                         print(f"I2S写入错误: {e}")
-                        raise
-                # else:
-                    # waiting_for_data = True  # 缓冲区空了，等待新数据
-                    # time.sleep_ms(5)
-                        
+                        time.sleep_ms(10)
+                else:
+                    time.sleep_ms(5)
+                    
             except Exception as e:
                 print("播放线程错误:", e)
                 time.sleep_ms(10)
-                
+
     def play_audio(self, audio_bytes):
         """处理接收到的音频数据"""
         try:
