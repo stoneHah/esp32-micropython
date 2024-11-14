@@ -148,7 +148,7 @@ class AudioChatClient:
         
         # WebSocket配置
         self.ws = None
-        self.ws_server = "ws://192.168.0.109:8000/ws"
+        self.ws_server = "ws://192.168.2.227:8000/ws"
         self.reconnect_attempts = 3
         self.is_connected = False
         
@@ -200,7 +200,9 @@ class AudioChatClient:
     
     def _is_ws_connected(self):
         return self.ws.open and self.is_connected
-            
+    
+    
+    
     def receive_messages(self):
         """接收服务器消息的线程"""
         while True:
@@ -220,8 +222,8 @@ class AudioChatClient:
                 if data['type'] == 'audio':
                     print("ws:Received audio data")
                     audio_bytes = bytes.fromhex(data['audio'])
-                    # self.audio_out.write(audio_bytes)
-                    self.play_audio(audio_bytes)
+                    self.audio_out.write(audio_bytes)
+                    # self.play_audio(audio_bytes)
                     
                 elif data['type'] == 'text':
                     print("AI回复:", data['text'])
@@ -316,20 +318,25 @@ class AudioChatClient:
                 # 从麦克读取数据
                 num_read = self.audio_in.readinto(audio_buffer)
                 if num_read > 0:
-                    print(f"发送数据块大小: {num_read} bytes")
                     
                     # 检测是否有声音活动
                     has_voice = self.detect_voice_activity(audio_buffer)
                     self.led.value(1 if has_voice else 0)  # LED指示
                     
-                    # 发送音频数据 - 不再在这里处理连接状态
-                    if self.ws.open:
+                    # 只在检测到声音活动时才发送音频数据
+                    if has_voice and self._is_ws_connected():
                         try:
                             message = {
                                 'type': 'audio',
                                 'audio': bytes(audio_buffer[:num_read]).hex()
                             }
+                            print(f"发送数据块大小: {num_read} bytes")
                             self.ws.send(json.dumps(message))
+                            time.sleep_ms(10)
+                        except OSError as e:
+                            print("WebSocket连接已断开")
+                            self.is_connected = False  # 确保连接状态正确更新
+                            break  # 退出接收循环，让监控线程处理重连
                         except Exception as e:
                             print(f"发送数据错误: {e}")
                     
@@ -348,7 +355,7 @@ class AudioChatClient:
         if self.current_state == self.STATE_RECORDING:
             self.current_state = self.STATE_IDLE
             # 发送录音结束信号
-            if self.ws.open:
+            if self._is_ws_connected():
                 try:
                     self.ws.send(json.dumps({
                         'type': 'end_recording'
