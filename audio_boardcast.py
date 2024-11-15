@@ -12,12 +12,16 @@ class AudioChatClient:
         self.host = host
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # 使用 UDP
+        self.receive_buffer = bytearray(1024)  # 预分配接收缓冲区
+        self.sock.setblocking(False)  # 设置非阻塞模式
+
         self.chunk_size = 1024  # UDP推荐的数据包大小
         self.sequence = 0  # 包序号，用于接收端重组
         self.audio_buffer_size = 1024
         self.current_state = STATE_IDLE
         
         self.record_thread_running = True
+        self.receive_thread_running = True
         
         # 按钮和LED配置
         self.button = Pin(0, Pin.IN, Pin.PULL_UP)  # 使用GPIO0作为按钮输入
@@ -35,9 +39,30 @@ class AudioChatClient:
             rate=8000,            
             ibuf=4096,
         )
+
+        # I2S扬声器配置
+        self.audio_out = I2S(
+            0,                      
+            sck=Pin(12),           
+            ws=Pin(14),            
+            sd=Pin(13),            
+            mode=I2S.TX,           
+            bits=16,               
+            format=I2S.MONO,       
+            rate=24000,            
+            ibuf=4096,
+        )
         
         # 定义特殊的结束标记
         self.END_MARKER = b'END_OF_AUDIO'
+        
+        # 添加用于音频重组的缓冲区
+        self.received_chunks = {}  # 用于存储接收到的音频块
+        self.current_sequence = 0  # 当前期望的序列号
+        self.last_chunk_time = time.time()  # 最后收到数据包的时间
+        self.chunk_timeout = 2  # 数据包超时时间（秒）
+        
+        
         
     def send_audio(self, audio_buffer, num_read):
         try:
@@ -128,6 +153,7 @@ class AudioChatClient:
         print("cleanup")
         self.current_state = STATE_IDLE
         self.record_thread_running = False
+        self.receive_thread_running = False
         time.sleep_ms(200)  # 等待线程结束
         
         if self.sock:
@@ -135,15 +161,64 @@ class AudioChatClient:
         if self.audio_in:
             self.audio_in.deinit()
     
+    def receive_audio(self):
+        """接收并处理音频数据"""
+        try:
+            while self.receive_thread_running:
+                try:
+                    # 使用预分配的缓冲区接收数据
+                    size = self.sock.readinto(self.receive_buffer)
+                    if not size:
+                        time.sleep_ms(5)  # 如果没有数据，短暂休眠
+                        continue
+
+                    data = self.receive_buffer[:size]
+                    
+                    if len(data) < 3:
+                        continue
+                        
+                    message_type = data[0]
+                    sequence = int.from_bytes(data[1:3], 'big')
+                    audio_chunk = data[3:]
+                    
+                    if message_type == 1:
+                        print(f"播放音频块 {sequence}, 大小: {len(audio_chunk)}")
+                        self.audio_out.write(audio_chunk)
+                except OSError as e:
+                    if e.args[0] == 11:  # EAGAIN 错误，表示暂时没有数据
+                        time.sleep_ms(5)
+                    else:
+                        print(f"接收错误: {e}")
+                        
+        except Exception as e:
+            print(f"接收音频错误: {e}")
+    
+    def play_continuous_chunks(self):
+        """播放连续的音频块"""
+        while self.current_sequence in self.received_chunks:
+            chunk = self.received_chunks.pop(self.current_sequence)
+            try:
+                # 将音频数据写入I2S
+                bytes_written = self.audio_out.write(chunk)
+                print(f"播放音频块 {self.current_sequence}, 写入 {bytes_written} 字节")
+            except Exception as e:
+                print(f"播放音频错误: {e}")
+            
+            self.current_sequence += 1
+    
     def start_chat(self):
         """开始对话"""
         try:
-            
             # 设置按钮中断
             self.button.irq(trigger=Pin.IRQ_FALLING, handler=self.button_handler)
+            
+            # 启动录音线程
             _thread.start_new_thread(self.start_recording, ())
             
-            print("ready, press button to start/stop recording")
+            # 启动接收线程
+            _thread.start_new_thread(self.receive_audio, ())
+            
+            print("准备就绪，按下按钮开始/停止录音")
             
             # 主循环
             while True:
@@ -154,5 +229,6 @@ class AudioChatClient:
         finally:
             self.cleanup()
             
-AudioChatClient(host="192.168.2.227", port=8765).start_chat()
+AudioChatClient(host="192.168.0.109", port=8765).start_chat()
+# AudioChatClient(host="192.168.2.227", port=8765).start_chat()
         
