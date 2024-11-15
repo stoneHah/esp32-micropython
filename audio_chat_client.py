@@ -127,8 +127,6 @@ class AudioChatClient:
             format=I2S.MONO,       
             rate=8000,            
             ibuf=4096,
-            # dma_buf_count=8,      # 增加DMA缓冲区数量
-            # dma_buf_len=1024      # 设置DMA缓冲区长度
         )
         
         # I2S扬声器配置
@@ -148,7 +146,8 @@ class AudioChatClient:
         
         # WebSocket配置
         self.ws = None
-        self.ws_server = "ws://192.168.2.227:8000/ws"
+        self.ws_server = "ws://192.168.0.109:8000/ws"
+        # self.ws_server = "ws://192.168.2.227:8000/ws"
         self.reconnect_attempts = 3
         self.is_connected = False
         
@@ -252,13 +251,16 @@ class AudioChatClient:
     def detect_voice_activity(self, audio_data):
         """改进的语音活动检测"""
         try:
+            # 创建音频数据的副本以避免修改原始数据
+            audio_copy = audio_data[:]
+            
             # 计算当前帧的音量
             total = 0
-            data_length = len(audio_data)  
+            data_length = len(audio_copy)  
             i = 0
             while i < data_length - 1:
                 # 将两个字节组合成16位整数
-                value = (audio_data[i+1] << 8) | audio_data[i]
+                value = (audio_copy[i+1] << 8) | audio_copy[i]
                 if value & 0x8000:
                     value -= 65536
                 total += abs(value)
@@ -313,6 +315,7 @@ class AudioChatClient:
         self.is_speaking = False
         self.vad_window = []
         
+        total_bytes = 0
         while self.current_state == self.STATE_RECORDING:
             try:
                 # 从麦克读取数据
@@ -320,22 +323,25 @@ class AudioChatClient:
                 if num_read > 0:
                     
                     # 检测是否有声音活动
-                    has_voice = self.detect_voice_activity(audio_buffer)
+                    # has_voice = self.detect_voice_activity(audio_buffer)
+                    has_voice = True
                     self.led.value(1 if has_voice else 0)  # LED指示
                     
                     # 只在检测到声音活动时才发送音频数据
-                    if has_voice and self._is_ws_connected():
+                    if self._is_ws_connected():
                         try:
                             message = {
                                 'type': 'audio',
                                 'audio': bytes(audio_buffer[:num_read]).hex()
                             }
+                            total_bytes += num_read
                             print(f"发送数据块大小: {num_read} bytes")
                             self.ws.send(json.dumps(message))
-                            time.sleep_ms(10)
+                            # time.sleep_ms(50)
                         except OSError as e:
                             print("WebSocket连接已断开")
                             self.is_connected = False  # 确保连接状态正确更新
+                            self.stop_recording()
                             break  # 退出接收循环，让监控线程处理重连
                         except Exception as e:
                             print(f"发送数据错误: {e}")
@@ -343,6 +349,7 @@ class AudioChatClient:
                     # 如果已经开始说话且检测到足够长的静音，自动停止录音
                     if not has_voice and self.is_speaking:
                         print("检测到足够长的静音，自动停止录音")
+                        print(f"总共发送数据: {total_bytes} bytes")
                         self.stop_recording()
                         break
                     
@@ -419,7 +426,7 @@ class AudioChatClient:
                     try:
                         num_written = 0
                         while num_written < len(chunk):
-                            num_written += self.audio_out.write(buf[num_written:len(chunk)])
+                            num_written += self.audio_out.write(chunk[num_written:len(chunk)])
                     except Exception as e:
                         print(f"I2S写入错误: {e}")
                         time.sleep_ms(10)
