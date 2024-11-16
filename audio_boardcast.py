@@ -36,7 +36,7 @@ class AudioChatClient:
             mode=I2S.RX,           
             bits=16,               
             format=I2S.MONO,       
-            rate=8000,            
+            rate=16000,            
             ibuf=4096,
         )
 
@@ -160,6 +160,8 @@ class AudioChatClient:
             self.sock.close()
         if self.audio_in:
             self.audio_in.deinit()
+        if self.audio_out:
+            self.audio_out.deinit()
     
     def receive_audio(self):
         """接收并处理音频数据"""
