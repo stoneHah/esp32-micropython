@@ -2,6 +2,7 @@ import socket
 import time
 from machine import Pin, I2S, Timer
 import _thread
+from myutil import RingBuffer
 
 # 状态标志
 STATE_IDLE = 0      # 空闲状态
@@ -12,7 +13,7 @@ class AudioChatClient:
         self.host = host
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # 使用 UDP
-        self.receive_buffer = bytearray(1024)  # 预分配接收缓冲区
+        self.receive_buffer = bytearray(1500)  # 预分配接收缓冲区
         self.sock.setblocking(False)  # 设置非阻塞模式
 
         self.chunk_size = 1024  # UDP推荐的数据包大小
@@ -22,6 +23,7 @@ class AudioChatClient:
         
         self.record_thread_running = True
         self.receive_thread_running = True
+        self.play_thread_running = True
         
         # 按钮和LED配置
         self.button = Pin(0, Pin.IN, Pin.PULL_UP)  # 使用GPIO0作为按钮输入
@@ -50,8 +52,10 @@ class AudioChatClient:
             bits=16,               
             format=I2S.MONO,       
             rate=24000,            
-            ibuf=4096,
+            ibuf=20000,
         )
+
+        self.ring_buffer = RingBuffer(1024 * 24)
         
         # 定义特殊的结束标记
         self.END_MARKER = b'END_OF_AUDIO'
@@ -154,6 +158,7 @@ class AudioChatClient:
         self.current_state = STATE_IDLE
         self.record_thread_running = False
         self.receive_thread_running = False
+        self.play_thread_running = False
         time.sleep_ms(200)  # 等待线程结束
         
         if self.sock:
@@ -185,7 +190,8 @@ class AudioChatClient:
                     
                     if message_type == 1:
                         print(f"播放音频块 {sequence}, 大小: {len(audio_chunk)}")
-                        self.audio_out.write(audio_chunk)
+                        # self.audio_out.write(audio_chunk)
+                        add_to_buffer(audio_chunk)
                 except OSError as e:
                     if e.args[0] == 11:  # EAGAIN 错误，表示暂时没有数据
                         time.sleep_ms(5)
@@ -195,18 +201,45 @@ class AudioChatClient:
         except Exception as e:
             print(f"接收音频错误: {e}")
     
-    def play_continuous_chunks(self):
-        """播放连续的音频块"""
-        while self.current_sequence in self.received_chunks:
-            chunk = self.received_chunks.pop(self.current_sequence)
-            try:
-                # 将音频数据写入I2S
-                bytes_written = self.audio_out.write(chunk)
-                print(f"播放音频块 {self.current_sequence}, 写入 {bytes_written} 字节")
-            except Exception as e:
-                print(f"播放音频错误: {e}")
-            
-            self.current_sequence += 1
+    def add_to_buffer(self, audio_bytes):
+        # 写入环形缓冲区
+        while len(audio_bytes) > 0:
+            written = self.ring_buffer.write(audio_bytes)
+            if written == 0:
+                # 缓冲区满，等待一会
+                time.sleep_ms(20)
+            else:
+                audio_bytes = audio_bytes[written:]
+        
+    
+    def play_audio(self):
+        """播放音频"""
+        buffer_threshold = 1024 * 8  # 8KB的缓冲区阈值
+        chunk_size = 1024  # 每次播放的数据块大小
+        last_print_time = time.ticks_ms()  # 上次打印时间
+        print_interval = 1000  # 打印间隔(毫秒)
+        
+        try:
+            while self.play_thread_running:
+                current_time = time.ticks_ms()
+                
+                # 检查缓冲区中是否有足够的数据
+                if self.ring_buffer.available >= chunk_size:
+                    # 读取并播放数据
+                    audio_bytes = self.ring_buffer.read(chunk_size)
+                    if audio_bytes:
+                        num_written = 0
+                        while num_written < len(audio_bytes):
+                            num_written += self.audio_out.write(audio_bytes[num_written:])
+                else:
+                    # 每隔一秒打印一次等待信息
+                    if time.ticks_diff(current_time, last_print_time) >= print_interval:
+                        print(f"等待数据积累,当前:{self.ring_buffer.available}/{buffer_threshold}")
+                        last_print_time = current_time
+                    time.sleep_ms(10)
+                    
+        except Exception as e:
+            print(f"播放音频错误: {e}")
     
     def start_chat(self):
         """开始对话"""
@@ -214,17 +247,43 @@ class AudioChatClient:
             # 设置按钮中断
             self.button.irq(trigger=Pin.IRQ_FALLING, handler=self.button_handler)
             
-            # 启动录音线程
-            _thread.start_new_thread(self.start_recording, ())
-            
-            # 启动接收线程
-            _thread.start_new_thread(self.receive_audio, ())
-            
             print("准备就绪，按下按钮开始/停止录音")
+            # 启动播放线程
+            # _thread.start_new_thread(self.play_audio, ())
+
+            # # 启动录音线程
+            # _thread.start_new_thread(self.start_recording, ())
             
+            # # 启动接收线程
+            # _thread.start_new_thread(self.receive_audio, ())
+            
+            
+            
+            audio_buffer = bytearray(self.audio_buffer_size)
             # 主循环
             while True:
-                time.sleep(1)
+                if self.current_state == STATE_RECORDING:
+                    # 从麦克风读取数据
+                    num_read = self.audio_in.readinto(audio_buffer)
+                    if num_read > 0:
+                        print(f"start_recording num_read: {num_read}")
+                        self.send_audio(audio_buffer, num_read)
+
+                 # 处理接收
+                try:
+                    data, addr = self.sock.recvfrom(1500)
+                    if data and len(data) >= 3:
+                        message_type = data[0]
+                        sequence = int.from_bytes(data[1:3], 'big')
+                        audio_chunk = data[3:]
+                        if message_type == 1:
+                            self.audio_out.write(audio_chunk)
+                            # self.add_to_buffer(audio_chunk)
+                except OSError as e:
+                    if e.args[0] != 11:
+                        print(f"接收错误: {e}")
+
+                time.sleep_ms(1)
                 
         except KeyboardInterrupt:
             print("end chat")
