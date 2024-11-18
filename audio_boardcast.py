@@ -4,8 +4,10 @@ from machine import Pin, I2S, Timer
 import _thread
 
 # 状态标志
-STATE_IDLE = 0      # 空闲状态
-STATE_RECORDING = 1 # 录音状态
+STATE_STOPPED = 0      # 完全停止状态
+STATE_STANDBY = 1     # 待机状态(可以录音和播放音频)
+STATE_RECORDING = 2 # 录音状态
+STATE_PLAYING = 3  # 播放状态
 
 class AudioChatClient:
     def __init__(self, host, port):
@@ -18,7 +20,7 @@ class AudioChatClient:
         self.chunk_size = 1024  # UDP推荐的数据包大小
         self.sequence = 0  # 包序号，用于接收端重组
         self.audio_buffer_size = 1024
-        self.current_state = STATE_IDLE
+        self.current_state = STATE_STOPPED  # 初始状态为完全停止状态
         
         self.record_thread_running = True
         self.receive_thread_running = True
@@ -30,6 +32,17 @@ class AudioChatClient:
         
          # 定义特殊的结束标记
         self.END_MARKER = b'END_OF_AUDIO'
+        
+         # VAD相关参数
+        self.vad_threshold = 500  # 声音阈值，根据实际情况调整
+        self.silence_frames = 0   # 连续静音帧计数
+        self.voice_frames = 0     # 连续有声帧计数
+        self.max_silence_frames = 50  # 最大静音帧数
+        self.vad_window = []      # 滑动窗口
+        self.vad_window_size = 4  # 窗口数量
+        self.frames_to_confirm_silence = 8  # 降低到8帧，约2秒静音就停止
+        
+        self.is_speaking = False
         
         # I2S麦克风配置
         self.audio_in = I2S(
@@ -121,31 +134,28 @@ class AudioChatClient:
         except Exception as e:
             print(f"发送结束标记错误: {e}")
     
-    def stop_recording(self):
-        """停止录音"""
-        if self.current_state == STATE_RECORDING:
-            # 先发送结束标记
-            self.send_end_marker()
-            # 然后更新状态
-            self.current_state = STATE_IDLE
-            self.sequence = 0
-            print("录音已停止")
+    
                 
     def button_handler(self, pin):
         """按钮中断处理"""
         time.sleep(0.02)  # 消除按钮抖动
         print("button pressed, value:", pin.value())
         if pin.value() == 0:  # 按钮按下
-            if self.current_state == STATE_IDLE:
-                print("start recording...")
-                self.current_state = STATE_RECORDING
-            elif self.current_state == STATE_RECORDING:
-                print("stop recording...")
-                self.stop_recording()
+            if self.current_state == STATE_STOPPED:
+                print("system startup, standby")
+                self.current_state = STATE_STANDBY
+                self.led.value(1)
+            else:
+                print("system shutdown")
+                if self.current_state == STATE_RECORDING:
+                    self.send_end_marker() #如果正在录音，则先发送结束标记
+                self.current_state = STATE_STOPPED
+                self.led.value(0)
+                self.sequence = 0
                 
     def cleanup(self):
         print("cleanup")
-        self.current_state = STATE_IDLE
+        self.current_state = STATE_STOPPED
         self.record_thread_running = False
         self.receive_thread_running = False
         self.play_thread_running = False
@@ -179,7 +189,56 @@ class AudioChatClient:
         except Exception as e:
             print(f"接收音频错误: {e}")
     
+    
+    def calculate_energy(self, buffer, length):
+        """计算音频片段的能量"""
+        energy = 0
+        for i in range(0, length, 2):
+            sample = buffer[i] | (buffer[i + 1] << 8)
+            if sample & 0x8000:  # 处理负数
+                sample = sample - 0x10000
+            energy += abs(sample)
+        return energy / (length // 2)
         
+    def detect_voice(self, buffer, length):
+        """使用滑动窗口检测声音活动"""
+        try:
+            # 计算当前帧的能量
+            current_energy = self.calculate_energy(buffer, length)
+            
+            # 更新滑动窗口
+            self.vad_window.append(current_energy)
+            if len(self.vad_window) > self.vad_window_size:
+                self.vad_window.pop(0)
+                
+            # 计算平均能量
+            average_energy = sum(self.vad_window) / len(self.vad_window)
+            
+            print(f"average_energy: {average_energy}, threshold: {self.vad_threshold}")
+            
+            # 判断是否有声音
+            if average_energy > self.vad_threshold:
+                self.voice_frames += 1
+                self.silence_frames = 0
+                if self.voice_frames >= 2:  # 至少需要2帧连续检测到声音
+                    self.is_speaking = True
+                    print("detected speaking...")
+            else:
+                if self.is_speaking:  # 只在说话状态下计数静音帧
+                    self.silence_frames += 1
+                    print(f"静音帧数: {self.silence_frames}")
+                self.voice_frames = 0
+                
+            # 静音检测
+            if self.is_speaking and self.silence_frames >= self.frames_to_confirm_silence:
+                print(f"检测到{self.frames_to_confirm_silence}帧静音，停止录音")
+                return False
+            
+            return self.is_speaking
+                
+        except Exception as e:
+            print(f"Voice detection error: {e}")
+            return False
     
     
     def start_chat(self):
@@ -197,15 +256,34 @@ class AudioChatClient:
             _thread.start_new_thread(self.receive_audio, ())
             
             audio_buffer = bytearray(self.audio_buffer_size)
+            is_speaking = False  # 是否正在说话
+            
             # 主循环
             while True:
-                if self.current_state == STATE_RECORDING:
+                if self.current_state != STATE_STOPPED:
                     # 从麦克风读取数据
                     num_read = self.audio_in.readinto(audio_buffer)
                     if num_read > 0:
-                        print(f"start_recording num_read: {num_read}")
-                        self.send_audio(audio_buffer, num_read)
-
+                        has_voice = self.detect_voice(audio_buffer, num_read)
+                        
+                        # LED指示声音活动
+                        self.led.value(1 if has_voice else 0)
+                        
+                        if has_voice:
+                            # 发送音频数据
+                            print('发送音频数据...')
+                            self.current_state = STATE_RECORDING
+                            # self.send_audio(audio_buffer, num_read)
+                        else:
+                            if self.is_speaking:
+                                print("检测到静音，停止发送")
+                                self.is_speaking = False
+                                self.current_state = STATE_STANDBY
+                                print('发送结束标记...')
+                                # self.send_end_marker()
+                                # 清空VAD窗口
+                                self.vad_window.clear()
+                                
                 time.sleep_ms(1)
                 
         except KeyboardInterrupt:
