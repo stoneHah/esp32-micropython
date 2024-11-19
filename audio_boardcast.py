@@ -29,6 +29,10 @@ class AudioChatClient:
         # 按钮和LED配置
         self.button = Pin(0, Pin.IN, Pin.PULL_UP)  # 使用GPIO0作为按钮输入
         self.led = Pin(2, Pin.OUT)                 # 使用GPIO2作为LED指示
+
+        # 添加预缓冲区相关参数
+        self.pre_buffer = []
+        self.pre_buffer_size = 10  # 保存最近5帧的数据
         
          # 定义特殊的结束标记
         self.END_MARKER = b'END_OF_AUDIO'
@@ -40,7 +44,7 @@ class AudioChatClient:
         self.max_silence_frames = 50  # 最大静音帧数
         self.vad_window = []      # 滑动窗口
         self.vad_window_size = 4  # 窗口数量
-        self.frames_to_confirm_silence = 8  # 降低到8帧，约2秒静音就停止
+        self.frames_to_confirm_silence = 50  # 降低到8帧，约2秒静音就停止
         
         self.is_speaking = False
         
@@ -70,6 +74,7 @@ class AudioChatClient:
             ibuf=20000,
         )
 
+        
         
     def send_audio(self, audio_buffer, num_read):
         try:
@@ -214,7 +219,7 @@ class AudioChatClient:
             # 计算平均能量
             average_energy = sum(self.vad_window) / len(self.vad_window)
             
-            print(f"average_energy: {average_energy}, threshold: {self.vad_threshold}")
+            # print(f"average_energy: {average_energy}, threshold: {self.vad_threshold}")
             
             # 判断是否有声音
             if average_energy > self.vad_threshold:
@@ -232,13 +237,14 @@ class AudioChatClient:
             # 静音检测
             if self.is_speaking and self.silence_frames >= self.frames_to_confirm_silence:
                 print(f"检测到{self.frames_to_confirm_silence}帧静音，停止录音")
-                return False
+                self.is_speaking = False
             
             return self.is_speaking
                 
         except Exception as e:
             print(f"Voice detection error: {e}")
-            return False
+            self.is_speaking = False
+            return self.is_speaking
     
     
     def start_chat(self):
@@ -264,23 +270,32 @@ class AudioChatClient:
                     # 从麦克风读取数据
                     num_read = self.audio_in.readinto(audio_buffer)
                     if num_read > 0:
+                        # 保存当前帧到预缓冲区
+                        self.pre_buffer.append(audio_buffer[:num_read])
+                        if len(self.pre_buffer) > self.pre_buffer_size:
+                            self.pre_buffer.pop(0)
+                            
                         has_voice = self.detect_voice(audio_buffer, num_read)
                         
                         # LED指示声音活动
-                        self.led.value(1 if has_voice else 0)
+                        self.led.value(1 if self.is_speaking else 0)
                         
                         if has_voice:
-                            # 发送音频数据
+                            if self.current_state != STATE_RECORDING:
+                                # 首次检测到声音，先发送预缓冲区的数据
+                                print('发送预缓冲数据...')
+                                for buffered_data in self.pre_buffer:
+                                    self.send_audio(buffered_data, len(buffered_data))
+                                self.current_state = STATE_RECORDING
+                            
                             print('发送音频数据...')
-                            self.current_state = STATE_RECORDING
-                            # self.send_audio(audio_buffer, num_read)
+                            self.send_audio(audio_buffer, num_read)
                         else:
-                            if self.is_speaking:
+                            if self.current_state == STATE_RECORDING:
                                 print("检测到静音，停止发送")
-                                self.is_speaking = False
                                 self.current_state = STATE_STANDBY
                                 print('发送结束标记...')
-                                # self.send_end_marker()
+                                self.send_end_marker()
                                 # 清空VAD窗口
                                 self.vad_window.clear()
                                 
