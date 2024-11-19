@@ -83,7 +83,7 @@ class AudioChatClient:
             for i in range(0, num_read, self.chunk_size):
                 chunk = audio_bytes[i:i + self.chunk_size]
                 # 添加序号到数据包
-                print(f"send_audio sequence: {self.sequence}")
+                # print(f"send_audio sequence: {self.sequence}")
                 packet = self.sequence.to_bytes(2, 'big') + chunk
                 self.sock.sendto(packet, (self.host, self.port))
                 self.sequence = (self.sequence + 1) % 65536  # 循环使用序号
@@ -104,24 +104,47 @@ class AudioChatClient:
             pass
         
     def start_recording(self):
-        """开始录音并发送"""
-        print("start_recording thread")
+        """音频处理线程：处理录音和语音检测"""
         audio_buffer = bytearray(self.audio_buffer_size)
         
-        try:
-            while self.record_thread_running:
-                if self.current_state == STATE_RECORDING:
+        while self.record_thread_running:
+            if self.current_state != STATE_STOPPED:
+                try:
                     # 从麦克风读取数据
                     num_read = self.audio_in.readinto(audio_buffer)
                     if num_read > 0:
-                        print(f"start_recording num_read: {num_read}")
-                        self.send_audio(audio_buffer, num_read)
-                
-                time.sleep_ms(10)
-        except Exception as e:
-            print(f"录音线程错误: {e}")
-        finally:
-            print("录音线程结束")
+                        # 保存当前帧到预缓冲区
+                        self.pre_buffer.append(audio_buffer[:num_read])
+                        if len(self.pre_buffer) > self.pre_buffer_size:
+                            self.pre_buffer.pop(0)
+                            
+                        has_voice = self.detect_voice(audio_buffer, num_read)
+                        
+                        # LED指示声音活动
+                        self.led.value(1 if self.is_speaking else 0)
+                        
+                        if has_voice:
+                            if self.current_state != STATE_RECORDING:
+                                # 首次检测到声音，先发送预缓冲区的数据
+                                print('发送预缓冲数据...')
+                                for buffered_data in self.pre_buffer:
+                                    self.send_audio(buffered_data, len(buffered_data))
+                                self.current_state = STATE_RECORDING
+                            
+                            print('发送音频数据...')
+                            self.send_audio(audio_buffer, num_read)
+                        else:
+                            if self.current_state == STATE_RECORDING:
+                                print("检测到静音，停止发送")
+                                self.current_state = STATE_STANDBY
+                                print('发送结束标记...')
+                                self.send_end_marker()
+                                # 清空VAD窗口
+                                self.vad_window.clear()
+                except Exception as e:
+                    print(f"音频处理错误: {e}")
+            
+            time.sleep_ms(10)  # 适当的休眠时间
 
     def send_end_marker(self):
         """发送录音结束标记"""
@@ -256,50 +279,14 @@ class AudioChatClient:
             print("准备就绪，按下按钮开始/停止录音")
 
             # # 启动录音线程
-            # _thread.start_new_thread(self.start_recording, ())
+            _thread.start_new_thread(self.start_recording, ())
             
             # 启动接收线程
             _thread.start_new_thread(self.receive_audio, ())
             
-            audio_buffer = bytearray(self.audio_buffer_size)
-            is_speaking = False  # 是否正在说话
-            
             # 主循环
             while True:
-                if self.current_state != STATE_STOPPED:
-                    # 从麦克风读取数据
-                    num_read = self.audio_in.readinto(audio_buffer)
-                    if num_read > 0:
-                        # 保存当前帧到预缓冲区
-                        self.pre_buffer.append(audio_buffer[:num_read])
-                        if len(self.pre_buffer) > self.pre_buffer_size:
-                            self.pre_buffer.pop(0)
-                            
-                        has_voice = self.detect_voice(audio_buffer, num_read)
-                        
-                        # LED指示声音活动
-                        self.led.value(1 if self.is_speaking else 0)
-                        
-                        if has_voice:
-                            if self.current_state != STATE_RECORDING:
-                                # 首次检测到声音，先发送预缓冲区的数据
-                                print('发送预缓冲数据...')
-                                for buffered_data in self.pre_buffer:
-                                    self.send_audio(buffered_data, len(buffered_data))
-                                self.current_state = STATE_RECORDING
-                            
-                            print('发送音频数据...')
-                            self.send_audio(audio_buffer, num_read)
-                        else:
-                            if self.current_state == STATE_RECORDING:
-                                print("检测到静音，停止发送")
-                                self.current_state = STATE_STANDBY
-                                print('发送结束标记...')
-                                self.send_end_marker()
-                                # 清空VAD窗口
-                                self.vad_window.clear()
-                                
-                time.sleep_ms(1)
+                time.sleep_ms(100)
                 
         except KeyboardInterrupt:
             print("end chat")
