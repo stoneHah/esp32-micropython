@@ -51,7 +51,7 @@ class AudioChatClient:
         # I2S麦克风配置
         self.audio_in = I2S(
             1,                      
-            sck=Pin(16),           
+            sck=Pin(23),           
             ws=Pin(22),            
             sd=Pin(21),            
             mode=I2S.RX,           
@@ -74,6 +74,8 @@ class AudioChatClient:
             ibuf=20000,
         )
 
+        self.playback_timeout = 500  # 500ms 超时时间
+        self.last_playback_time = time.ticks_ms()
         
         
     def send_audio(self, audio_buffer, num_read):
@@ -108,7 +110,8 @@ class AudioChatClient:
         audio_buffer = bytearray(self.audio_buffer_size)
         
         while self.record_thread_running:
-            if self.current_state != STATE_STOPPED:
+            # 仅在不处于播放状态时读取麦克风数据
+            if self.current_state != STATE_STOPPED and self.current_state != STATE_PLAYING:
                 try:
                     # 从麦克风读取数据
                     num_read = self.audio_in.readinto(audio_buffer)
@@ -208,10 +211,18 @@ class AudioChatClient:
                         sequence = int.from_bytes(data[1:3], 'big')
                         audio_chunk = data[3:]
                         if message_type == 1:
+                            # 设置为播放状态
+                            self.current_state = STATE_PLAYING
                             self.audio_out.write(audio_chunk)
+                            # 更新最后播放时间
+                            self.last_playback_time = time.ticks_ms()
                 except OSError as e:
                     if e.args[0] != 11:
                         print(f"接收错误: {e}")
+                
+                # 检查播放超时
+                if self.current_state == STATE_PLAYING and time.ticks_diff(time.ticks_ms(), self.last_playback_time) > self.playback_timeout:
+                    self.current_state = STATE_STANDBY
                 
                 time.sleep_ms(1)
         except Exception as e:
