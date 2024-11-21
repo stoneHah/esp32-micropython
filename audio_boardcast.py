@@ -51,7 +51,7 @@ class AudioChatClient:
         # I2S麦克风配置
         self.audio_in = I2S(
             1,                      
-            sck=Pin(23),           
+            sck=Pin(16),           
             ws=Pin(22),            
             sd=Pin(21),            
             mode=I2S.RX,           
