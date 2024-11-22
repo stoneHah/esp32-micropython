@@ -1,7 +1,7 @@
 import socket
 import time
 from machine import Pin, I2S, Timer
-import _thread
+import uasyncio as asyncio
 
 # 状态标志
 STATE_STOPPED = 0      # 完全停止状态
@@ -21,10 +21,6 @@ class AudioChatClient:
         self.sequence = 0  # 包序号，用于接收端重组
         self.audio_buffer_size = 1024
         self.current_state = STATE_STOPPED  # 初始状态为完全停止状态
-        
-        self.record_thread_running = True
-        self.receive_thread_running = True
-        self.play_thread_running = True
         
         # 按钮和LED配置
         self.button = Pin(0, Pin.IN, Pin.PULL_UP)  # 使用GPIO0作为按钮输入
@@ -74,9 +70,12 @@ class AudioChatClient:
             ibuf=20000,
         )
 
-        self.playback_timeout = 500  # 500ms 超时时间
+        self.playback_timeout = 800  # 800ms 超时时间
         self.last_playback_time = time.ticks_ms()
         
+        # 添加事件循环相关属性
+        self.loop = None
+        self.tasks = []
         
     def send_audio(self, audio_buffer, num_read):
         try:
@@ -105,12 +104,11 @@ class AudioChatClient:
         except:
             pass
         
-    def start_recording(self):
-        """音频处理线程：处理录音和语音检测"""
+    async def record_audio(self):
+        """异步音频处理：处理录音和语音检测"""
         audio_buffer = bytearray(self.audio_buffer_size)
         
-        while self.record_thread_running:
-            # 仅在不处于播放状态时读取麦克风数据
+        while True:
             if self.current_state != STATE_STOPPED and self.current_state != STATE_PLAYING:
                 try:
                     # 从麦克风读取数据
@@ -147,7 +145,7 @@ class AudioChatClient:
                 except Exception as e:
                     print(f"音频处理错误: {e}")
             
-            time.sleep_ms(10)  # 适当的休眠时间
+            await asyncio.sleep_ms(10)
 
     def send_end_marker(self):
         """发送录音结束标记"""
@@ -187,10 +185,10 @@ class AudioChatClient:
     def cleanup(self):
         print("cleanup")
         self.current_state = STATE_STOPPED
-        self.record_thread_running = False
-        self.receive_thread_running = False
-        self.play_thread_running = False
-        time.sleep_ms(200)  # 等待线程结束
+        
+        # 取消所有任务
+        for task in self.tasks:
+            task.cancel()
         
         if self.sock:
             self.sock.close()
@@ -199,11 +197,11 @@ class AudioChatClient:
         if self.audio_out:
             self.audio_out.deinit()
     
-    def receive_audio(self):
-        """接收并处理音频数据"""
-        try:
-            while self.receive_thread_running:
-                # 处理接收
+    async def receive_audio(self):
+        """异步接收并处理音频数据"""
+        while True:
+            try:
+                # 非阻塞接收
                 try:
                     data, addr = self.sock.recvfrom(1500)
                     if data and len(data) >= 3:
@@ -217,16 +215,17 @@ class AudioChatClient:
                             # 更新最后播放时间
                             self.last_playback_time = time.ticks_ms()
                 except OSError as e:
-                    if e.args[0] != 11:
+                    if e.args[0] != 11:  # EAGAIN
                         print(f"接收错误: {e}")
                 
                 # 检查播放超时
                 if self.current_state == STATE_PLAYING and time.ticks_diff(time.ticks_ms(), self.last_playback_time) > self.playback_timeout:
                     self.current_state = STATE_STANDBY
+                    
+            except Exception as e:
+                print(f"接收音频错误: {e}")
                 
-                time.sleep_ms(1)
-        except Exception as e:
-            print(f"接收音频错误: {e}")
+            await asyncio.sleep_ms(1)
     
     
     def calculate_energy(self, buffer, length):
@@ -281,26 +280,24 @@ class AudioChatClient:
             return self.is_speaking
     
     
-    def start_chat(self):
-        """开始对话"""
+    async def start_chat(self):
+        """异步开始对话"""
         try:
             # 设置按钮中断
             self.button.irq(trigger=Pin.IRQ_FALLING, handler=self.button_handler)
             
             print("准备就绪，按下按钮开始/停止录音")
 
-            # # 启动录音线程
-            _thread.start_new_thread(self.start_recording, ())
+            # 创建并启动任务
+            record_task = asyncio.create_task(self.record_audio())
+            receive_task = asyncio.create_task(self.receive_audio())
+            self.tasks = [record_task, receive_task]
             
-            # 启动接收线程
-            _thread.start_new_thread(self.receive_audio, ())
-            
-            # 主循环
-            while True:
-                time.sleep_ms(100)
+            # 等待任务完成
+            await asyncio.gather(*self.tasks)
                 
-        except KeyboardInterrupt:
-            print("end chat")
+        except Exception as e:
+            print(f"聊天错误: {e}")
         finally:
             self.cleanup()
             
