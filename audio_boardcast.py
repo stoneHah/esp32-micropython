@@ -2,6 +2,7 @@ import socket
 import time
 from machine import Pin, I2S, Timer
 import uasyncio as asyncio
+from myutil import RingBuffer
 
 # 状态标志
 STATE_STOPPED = 0      # 完全停止状态
@@ -76,6 +77,10 @@ class AudioChatClient:
         # 添加事件循环相关属性
         self.loop = None
         self.tasks = []
+        
+        # 添加音频播放缓冲区
+        self.play_buffer = RingBuffer(32000)  # 32KB 缓冲区
+        self.min_playback_buffer = 4096  # 最小播放缓冲区大小
         
     def send_audio(self, audio_buffer, num_read):
         try:
@@ -201,7 +206,6 @@ class AudioChatClient:
         """异步接收并处理音频数据"""
         while True:
             try:
-                # 非阻塞接收
                 try:
                     data, addr = self.sock.recvfrom(1500)
                     if data and len(data) >= 3:
@@ -209,10 +213,9 @@ class AudioChatClient:
                         sequence = int.from_bytes(data[1:3], 'big')
                         audio_chunk = data[3:]
                         if message_type == 1:
-                            # 设置为播放状态
+                            # 将音频数据写入缓冲区
+                            self.play_buffer.write(audio_chunk)
                             self.current_state = STATE_PLAYING
-                            self.audio_out.write(audio_chunk)
-                            # 更新最后播放时间
                             self.last_playback_time = time.ticks_ms()
                 except OSError as e:
                     if e.args[0] != 11:  # EAGAIN
@@ -226,8 +229,26 @@ class AudioChatClient:
                 print(f"接收音频错误: {e}")
                 
             await asyncio.sleep_ms(1)
-    
-    
+            
+    async def play_audio(self):
+        """异步播放音频任务"""
+        while True:
+            if self.current_state == STATE_PLAYING:
+                try:
+                    # 当缓冲区数据足够或者有任何数据且超过播放超时时间时都进行播放
+                    if (self.play_buffer.available >= self.min_playback_buffer or 
+                        (self.play_buffer.available > 0 and 
+                         time.ticks_diff(time.ticks_ms(), self.last_playback_time) > self.playback_timeout)):
+                        
+                        chunk = self.play_buffer.read(1024)  # 每次读取1024字节播放
+                        if chunk:
+                            self.audio_out.write(chunk)
+                            self.last_playback_time = time.ticks_ms()
+                except Exception as e:
+                    print(f"播放音频错误: {e}")
+            
+            await asyncio.sleep_ms(5)
+            
     def calculate_energy(self, buffer, length):
         """计算音频片段的能量"""
         energy = 0
@@ -283,7 +304,6 @@ class AudioChatClient:
     async def start_chat(self):
         """异步开始对话"""
         try:
-            # 设置按钮中断
             self.button.irq(trigger=Pin.IRQ_FALLING, handler=self.button_handler)
             
             print("准备就绪，按下按钮开始/停止录音")
@@ -291,7 +311,8 @@ class AudioChatClient:
             # 创建并启动任务
             record_task = asyncio.create_task(self.record_audio())
             receive_task = asyncio.create_task(self.receive_audio())
-            self.tasks = [record_task, receive_task]
+            play_task = asyncio.create_task(self.play_audio())  # 添加播放任务
+            self.tasks = [record_task, receive_task, play_task]
             
             # 等待任务完成
             await asyncio.gather(*self.tasks)
