@@ -11,10 +11,10 @@ import image_data
 # TFT_CS =    const(25)
 # 定义TFT屏幕的引脚
 TFT_CLK = 18   # SCL (SCLK)
-TFT_MOSI = 23  # SDA (MOSI)
-TFT_DC = 2     # DC
-TFT_RST = 4    # RST
-TFT_CS = 5     # CS
+TFT_MOSI = 19  # SDA (MOSI)
+TFT_DC = 25     # DC
+TFT_RST = 26    # RST
+TFT_CS = 27     # CS
 
 # 初始化SPI
 spi = SPI(2, baudrate=20000000, polarity=0, phase=0, sck=Pin(TFT_CLK), mosi=Pin(TFT_MOSI))

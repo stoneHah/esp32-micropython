@@ -12,7 +12,7 @@ class AudioLoop:
             mode=I2S.RX,           # 接收模式
             bits=16,               # 采样位数
             format=I2S.MONO,       # 单声道
-            rate=16000,            # 采样率
+            rate=24000,            # 采样率
             ibuf=4096              # 输入缓冲区
         )
         
@@ -25,7 +25,7 @@ class AudioLoop:
             mode=I2S.TX,           # 发送模式
             bits=16,               # 采样位数
             format=I2S.MONO,       # 单声道
-            rate=16000,            # 采样率
+            rate=24000,            # 采样率
             ibuf=4096              # 输出缓冲区
         )
         
@@ -39,6 +39,7 @@ class AudioLoop:
             while True:
                 # 从麦克风读取数据
                 num_read = self.audio_in.readinto(audio_buffer)
+                print(f"读取到 {num_read} 字节数据")
                 if num_read > 0:
                     # 直接写入扬声器
                     self.audio_out.write(audio_buffer[:num_read])

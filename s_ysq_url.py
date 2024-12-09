@@ -40,21 +40,16 @@ class B525Player:
                 response.raw.read(1)
             
             # 读取并播放音频数据
-            buf = bytearray(1024)
             while True:
                 # 从URL读取音频数据
                 chunk = response.raw.read(1024)
                 if not chunk:
                     break
                 
-                # 将数据复制到缓冲区
-                for i in range(len(chunk)):
-                    buf[i] = chunk[i]
-                
-                # 通过I2S接口发送数据
+                # 直接通过I2S接口发送数据
                 num_written = 0
                 while num_written < len(chunk):
-                    num_written += self.audio_out.write(buf[num_written:len(chunk)])
+                    num_written += self.audio_out.write(chunk[num_written:])
             
             response.close()
                         
