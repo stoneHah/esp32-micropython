@@ -24,8 +24,8 @@ class AudioChatClient:
         self.current_state = STATE_STOPPED  # 初始状态为完全停止状态
         
         # 按钮和LED配置
-        self.button = Pin(0, Pin.IN, Pin.PULL_UP)  # 使用GPIO0作为按钮输入
-        self.led = Pin(2, Pin.OUT)                 # 使用GPIO2作为LED指示
+        self.button = Pin(0, Pin.IN, Pin.PULL_UP)  # 保持GPIO0作为按钮输入，因为它通常用作BOOT按钮
+        self.led = Pin(47, Pin.OUT)                # 修改为ESP32-S3板载LED的GPIO
 
         # 添加预缓冲区相关参数
         self.pre_buffer = []
@@ -48,9 +48,9 @@ class AudioChatClient:
         # I2S麦克风配置
         self.audio_in = I2S(
             1,                      
-            sck=Pin(23),           
-            ws=Pin(22),            
-            sd=Pin(21),            
+            sck=Pin(16),    # I2S_SCK (BCLK)        
+            ws=Pin(15),     # I2S_WS (LRCK)
+            sd=Pin(14),     # I2S_SD (DIN)
             mode=I2S.RX,           
             bits=16,               
             format=I2S.MONO,       
@@ -61,9 +61,9 @@ class AudioChatClient:
         # I2S扬声器配置
         self.audio_out = I2S(
             0,                      
-            sck=Pin(12),           
-            ws=Pin(14),            
-            sd=Pin(13),            
+            sck=Pin(17),    # I2S_SCK        
+            ws=Pin(18),     # I2S_WS
+            sd=Pin(19),     # I2S_SD
             mode=I2S.TX,           
             bits=16,               
             format=I2S.MONO,       
